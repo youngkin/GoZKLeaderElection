@@ -2,22 +2,28 @@ package leader
 
 import (
 	"fmt"
-	"github.com/samuel/go-zookeeper/zk"
+	zk "github.com/samuel/go-zookeeper/zk"
+	"sort"
 	"strings"
 	"time"
-	"sort"
 )
+
+type Candidate struct {
+	CandidateID            string
+	leaderNotificationChnl <-chan string
+}
 
 type LeaderElector struct {
 	zkHost       string
 	electionNode string
-	isLeader     bool
+	leader       string
 	zkConn       *zk.Conn
-	candidates []string
+	candidates   []Candidate
+	zkEventChnl  <-chan zk.Event
 }
 
 func NewLeaderElector(zkAddr string, electionNode string) (LeaderElector, error) {
-	conn := connect(zkAddr)
+	conn, evtChnl := connect(zkAddr)
 	//TODO: what should flags and acl be set to?
 	flags := int32(0)
 	acl := zk.WorldACL(zk.PermAll)
@@ -25,35 +31,64 @@ func NewLeaderElector(zkAddr string, electionNode string) (LeaderElector, error)
 	exists, _, _ := conn.Exists(electionNode)
 	var (
 		path string
-		err error
-		)
+		err  error
+	)
 	if !exists {
 		path, err = conn.Create(electionNode, []byte("data"), flags, acl)
 		must(err)
 		fmt.Printf("created: %+v\n", path)
 	}
-	
-	candidates := make([]string, 5)
-	return LeaderElector{zkAddr, electionNode, false, conn, candidates}, nil
+
+	candidates := make([]Candidate, 0)
+	return LeaderElector{zkAddr, electionNode, "", conn, candidates, evtChnl}, nil
 }
 
 func (le *LeaderElector) Connection() *zk.Conn {
 	return le.zkConn
 }
 
-func (le *LeaderElector) IsLeader() bool {
-	return le.isLeader
+func (le *LeaderElector) IsLeader(id string) bool {
+	return strings.EqualFold(le.leader, id)
 }
 
-func (le *LeaderElector) NominateAndElect(nomineePrefix, resource string) bool {
-	path := makeOffer(nomineePrefix, *le)
-	le.isLeader = determineLeader(path, le)
-	return le.isLeader
+// ElectLeader will, for a given nomineePrefix and resource, make the caller a candidate
+// for leadership and determine if the candidate becomes the leader.
+// The parameters are:
+//     nomineePrefix - a generic prefix (e.g., n_) for the election and a resource for which
+//     the election is being held (e.g., president).
+// It returns true if leader and a string representing the full path to the candidate ID
+// (e.g., /election/president/n_00001). The candidate ID is needed when and if a candidate
+// wants to resign as leader.
+func (le *LeaderElector) ElectLeader(nomineePrefix, resource string) (bool, Candidate) {
+	candidate := makeOffer(nomineePrefix, le)
+	isLeader := determineLeader(candidate.CandidateID, le)
+	return isLeader, candidate
 }
 
-func (le *LeaderElector) Resign() {
-	le.isLeader = false
-	le.zkConn.Close()
+// ElectAndSucceedLeader will, for a given nomineePrefix and resource, make the caller a candidate
+// for leadership and determine if the candidate becomes the leader.
+// The parameters are:
+//     nomineePrefix - a generic prefix (e.g., n_) for the election and a resource for which
+//     the election is being held (e.g., president).
+// It returns true if leader, a channel to notify candidates that the previous leader failed/resigned
+// and now they are the leader, and a string representing the full path to the candidate ID
+// (e.g., /election/president/n_00001). The candidate ID is needed when and if a candidate
+// wants to resign as leader.
+func (le *LeaderElector) ElectAndSucceedLeader(nomineePrefix, resource string) (bool, Candidate) {
+	candidate := makeOffer(nomineePrefix, le)
+	isLeader := determineLeader(candidate.CandidateID, le)
+	if !isLeader {
+		monitorLeaderChange(candidate.CandidateID, le)
+	}
+	return isLeader, candidate
+}
+
+func (le *LeaderElector) Resign(candidate Candidate) {
+	if strings.EqualFold(le.leader, candidate.CandidateID) {
+		le.leader = ""
+	}
+	le.zkConn.Delete(candidate.CandidateID, -1)
+	removeCandidate(le, candidate.CandidateID)
 	return
 }
 
@@ -62,43 +97,16 @@ func (le LeaderElector) String() string {
 	if le.zkConn != nil {
 		connected = "yes"
 	}
-	amILeader := "no"
-	if le.isLeader {
-		amILeader = "yes"
+	var candidatesAsString string
+	for _, candidate := range le.candidates {
+		candidatesAsString = candidatesAsString + candidate.CandidateID + " "
 	}
 	return "LeaderElector:" +
 		"\n\tzkHost: \t" + le.zkHost +
 		"\n\telectionNode: \t" + le.electionNode +
-		"\n\tisLeader: \t" + amILeader +
-		"\n\tconnected?: \t" + connected
-}
-
-func main() {
-	leaderElector, err := NewLeaderElector("192.168.12.11:2181", "/election")
-	must(err)
-	fmt.Println(leaderElector.String())
-	fmt.Println("leaderElector BEFORE ELECTION: leaderElector.IsLeader()?:", leaderElector.IsLeader())
-	isLeader := leaderElector.NominateAndElect("n_", "president")
-	fmt.Println("leaderElector AFTER ELECTION: isLeader?:", isLeader)
-	fmt.Println("leaderElector AFTER ELECTION: leaderElector.IsLeader()?:", leaderElector.IsLeader())
-
-	// start more candidates to see behavior when multiple candidates vie for leader
-	le2, err2 := NewLeaderElector("192.168.12.11:2181", "/election") //add another candidate
-	must(err2)
-	le3, err3 := NewLeaderElector("192.168.12.11:2181", "/election") //add yet another candidate
-	must(err3)
-
-	fmt.Println("\n")
-	le2Leader := le2.NominateAndElect("n_", "president")
-	fmt.Println("leaderElector2 AFTER ELECTION: isLeader?:", le2Leader)
-
-	fmt.Println("\n")
-	le3Leader := le3.NominateAndElect("n_", "president")
-	fmt.Println("leaderElector3 AFTER ELECTION: isLeader?:", le3Leader)
-	
-	fmt.Println("\n")
-	leaderElector.Resign()
-	fmt.Println("leaderElector AFTER RESIGN: leaderElector.IsLeader()?:", leaderElector.IsLeader())
+		"\n\tleader: \t" + le.leader +
+		"\n\tconnected?: \t" + connected +
+		"\n\tcandidates: \t" + candidatesAsString
 }
 
 func must(err error) {
@@ -107,39 +115,57 @@ func must(err error) {
 	}
 }
 
-func connect(zksStr string) *zk.Conn {
-//	zksStr := os.Getenv("ZOOKEEPER_SERVERS")
+func connect(zksStr string) (*zk.Conn, <-chan zk.Event) {
+	//	zksStr := os.Getenv("ZOOKEEPER_SERVERS")
 	zks := strings.Split(zksStr, ",")
-	conn, _, err := zk.Connect(zks, time.Second)
+	conn, evtChnl, err := zk.Connect(zks, time.Second)
 	must(err)
-	return conn
+	return conn, evtChnl
 }
 
-func makeOffer(nomineePrefix string, le LeaderElector) string {
+func makeOffer(nomineePrefix string, le *LeaderElector) Candidate {
 	flags := int32(zk.FlagSequence | zk.FlagEphemeral)
 	acl := zk.WorldACL(zk.PermAll)
 
 	// Make offer
 	path, err := le.zkConn.Create(strings.Join([]string{le.electionNode, nomineePrefix}, "/"), []byte("here"), flags, acl)
 	must(err)
-	fmt.Printf("created: %+v\n", path)
-	return path	
+	leaderNotificationChnl := make(chan string)
+	//	fmt.Printf("makeOffer: created: %+v\n", path)
+	candidate := Candidate{path, leaderNotificationChnl}
+	le.candidates = append(le.candidates, candidate)
+	//	fmt.Println("makeOffer: candidates:", le.candidates)
+	return candidate
+}
+
+func monitorLeaderChange(candidateID string, le *LeaderElector) <-chan string {
+	ldrshpChgChan := make(<-chan string)
+	return ldrshpChgChan
 }
 
 func determineLeader(path string, le *LeaderElector) bool {
-	fmt.Println("determineLeader: path", path)
-	snapshot, _, _, _ := le.zkConn.ChildrenW(le.electionNode)
-	sort.Strings(snapshot)
-	fmt.Println("Sorted Leader nominee list:", snapshot)
+	//	fmt.Println("determineLeader: path", path)
+	candidates, _, _, _ := le.zkConn.ChildrenW(le.electionNode)
+	sort.Strings(candidates)
+	//	fmt.Println("Sorted Leader nominee list:", candidates)
 	pathNodes := strings.Split(path, "/")
 	lenPath := len(pathNodes)
-	fmt.Println("Path nodes:", pathNodes, "len:", lenPath)
-	myID := pathNodes[lenPath - 1] 
-	fmt.Println("Election ID:", myID)
-	if strings.EqualFold(myID, snapshot[0]) {
-		le.isLeader = true 
-	} else {
-		le.isLeader = false
+	//	fmt.Println("Path nodes:", pathNodes, "len:", lenPath)
+	myID := pathNodes[lenPath-1]
+	//	fmt.Println("Election ID:", myID)
+	if strings.EqualFold(myID, candidates[0]) {
+		le.leader = path
+		return true
 	}
-	return le.isLeader
+
+	return false
+}
+
+func removeCandidate(le *LeaderElector, candidateID string) {
+	for i, candidate := range le.candidates {
+		if strings.EqualFold(candidate.CandidateID, candidateID) {
+			le.candidates = append(le.candidates[:i], le.candidates[i+1:]...)
+			break
+		}
+	}
 }
