@@ -8,12 +8,18 @@ import (
 	"time"
 )
 
+// Candidate represents a Election client that has requested leadership. It consists of a CandidateID
+// and a LeaderNotificationChnl. CandidateID uniquely identifies a specific client that has requested leadership
+// for a resource. LeaderNotificationChnl is used by the library to notify a candidate that was not initially
+// elected leader that it has assumed the leadership role for the resource.
 type Candidate struct {
 	CandidateID            string
-	leaderNotificationChnl <-chan string
+	LeaderNotificationChnl <-chan string
 }
 
-type LeaderElector struct {
+// Election is a structure that represents a new instance of a Election. This instance can then
+// be used to request leadership for a specific resource.
+type Election struct {
 	zkHost       string
 	electionNode string
 	leader       string
@@ -22,7 +28,17 @@ type LeaderElector struct {
 	zkEventChnl  <-chan zk.Event
 }
 
-func NewLeaderElector(zkAddr string, electionNode string) (LeaderElector, error) {
+// NewElection initializes a new instance of a Election that can later be used to request
+// leadership for a specific resource.
+//
+// It accepts:
+//	zkConn - a connection to a running Zookeeper instance
+//	resource - the resource for which leadership is being requested
+//
+// It will return either a non-nil Election instance and a nil error, or a nil
+// Election and a non-nil error.
+//
+func NewElection(zkAddr string, electionNode string) (Election, error) {
 	conn, evtChnl := connect(zkAddr)
 	//TODO: what should flags and acl be set to?
 	flags := int32(0)
@@ -39,15 +55,14 @@ func NewLeaderElector(zkAddr string, electionNode string) (LeaderElector, error)
 		fmt.Printf("created: %+v\n", path)
 	}
 
-	candidates := make([]Candidate, 0)
-	return LeaderElector{zkAddr, electionNode, "", conn, candidates, evtChnl}, nil
+	var candidates []Candidate
+	return Election{zkAddr, electionNode, "", conn, candidates, evtChnl}, nil
 }
 
-func (le *LeaderElector) Connection() *zk.Conn {
-	return le.zkConn
-}
-
-func (le *LeaderElector) IsLeader(id string) bool {
+// IsLeader returns true if the provided id is the leader, false otherwise.
+// Parameters:
+//	id - The ID of the candidate to be tested for leadership.
+func (le *Election) IsLeader(id string) bool {
 	return strings.EqualFold(le.leader, id)
 }
 
@@ -59,7 +74,7 @@ func (le *LeaderElector) IsLeader(id string) bool {
 // It returns true if leader and a string representing the full path to the candidate ID
 // (e.g., /election/president/n_00001). The candidate ID is needed when and if a candidate
 // wants to resign as leader.
-func (le *LeaderElector) ElectLeader(nomineePrefix, resource string) (bool, Candidate) {
+func (le *Election) ElectLeader(nomineePrefix, resource string) (bool, Candidate) {
 	candidate := makeOffer(nomineePrefix, le)
 	isLeader := determineLeader(candidate.CandidateID, le)
 	return isLeader, candidate
@@ -74,7 +89,7 @@ func (le *LeaderElector) ElectLeader(nomineePrefix, resource string) (bool, Cand
 // and now they are the leader, and a string representing the full path to the candidate ID
 // (e.g., /election/president/n_00001). The candidate ID is needed when and if a candidate
 // wants to resign as leader.
-func (le *LeaderElector) ElectAndSucceedLeader(nomineePrefix, resource string) (bool, Candidate) {
+func (le *Election) ElectAndSucceedLeader(nomineePrefix, resource string) (bool, Candidate) {
 	candidate := makeOffer(nomineePrefix, le)
 	isLeader := determineLeader(candidate.CandidateID, le)
 	if !isLeader {
@@ -83,7 +98,9 @@ func (le *LeaderElector) ElectAndSucceedLeader(nomineePrefix, resource string) (
 	return isLeader, candidate
 }
 
-func (le *LeaderElector) Resign(candidate Candidate) {
+// Resign removes the associated Election as leader or follower for the associated resource.
+//	candidate - The candidate who is resigning. The value for candidate is returned from ElectLeader.
+func (le *Election) Resign(candidate Candidate) {
 	if strings.EqualFold(le.leader, candidate.CandidateID) {
 		le.leader = ""
 	}
@@ -92,7 +109,8 @@ func (le *LeaderElector) Resign(candidate Candidate) {
 	return
 }
 
-func (le LeaderElector) String() string {
+// String is the Stringer implementation for this type.
+func (le Election) String() string {
 	connected := "no"
 	if le.zkConn != nil {
 		connected = "yes"
@@ -101,7 +119,7 @@ func (le LeaderElector) String() string {
 	for _, candidate := range le.candidates {
 		candidatesAsString = candidatesAsString + candidate.CandidateID + " "
 	}
-	return "LeaderElector:" +
+	return "Election:" +
 		"\n\tzkHost: \t" + le.zkHost +
 		"\n\telectionNode: \t" + le.electionNode +
 		"\n\tleader: \t" + le.leader +
@@ -123,7 +141,7 @@ func connect(zksStr string) (*zk.Conn, <-chan zk.Event) {
 	return conn, evtChnl
 }
 
-func makeOffer(nomineePrefix string, le *LeaderElector) Candidate {
+func makeOffer(nomineePrefix string, le *Election) Candidate {
 	flags := int32(zk.FlagSequence | zk.FlagEphemeral)
 	acl := zk.WorldACL(zk.PermAll)
 
@@ -138,12 +156,12 @@ func makeOffer(nomineePrefix string, le *LeaderElector) Candidate {
 	return candidate
 }
 
-func monitorLeaderChange(candidateID string, le *LeaderElector) <-chan string {
+func monitorLeaderChange(candidateID string, le *Election) <-chan string {
 	ldrshpChgChan := make(<-chan string)
 	return ldrshpChgChan
 }
 
-func determineLeader(path string, le *LeaderElector) bool {
+func determineLeader(path string, le *Election) bool {
 	//	fmt.Println("determineLeader: path", path)
 	candidates, _, _, _ := le.zkConn.ChildrenW(le.electionNode)
 	sort.Strings(candidates)
@@ -161,7 +179,7 @@ func determineLeader(path string, le *LeaderElector) bool {
 	return false
 }
 
-func removeCandidate(le *LeaderElector, candidateID string) {
+func removeCandidate(le *Election, candidateID string) {
 	for i, candidate := range le.candidates {
 		if strings.EqualFold(candidate.CandidateID, candidateID) {
 			le.candidates = append(le.candidates[:i], le.candidates[i+1:]...)

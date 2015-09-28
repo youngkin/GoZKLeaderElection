@@ -11,13 +11,16 @@ import (
 //	2. When a leader of multiple candidates resigns, one of the remaining candidates is chosen as leader
 //	3. When the last leader resigns there is no leader and no remaining candidates
 //	4. When the ZK connection is lost all candidates are notified and WHAT HAPPENS???
+//	5. How does it work in a distributed (i.e., multi-process/multi-host) environment
+//
 
 type ElectionResponse struct {
-	IsLeader bool
+	IsLeader    bool
 	CandidateID string
 }
+
 func main() {
-	le, err := leader.NewLeaderElector("192.168.12.11:2181", "/election")
+	le, err := leader.NewElection("192.168.12.11:2181", "/election")
 	must(err)
 	fmt.Println(le.String(), "\n\n")
 
@@ -27,17 +30,17 @@ func main() {
 		wg.Add(1)
 		go runCandidate("192.168.12.11:2181", "/election", &wg, &le, respCh)
 	}
-	
+
 	go func() {
 		wg.Wait()
 		close(respCh)
 	}()
-	
+
 	responses := make([]ElectionResponse, 0)
 	for response := range respCh {
 		fmt.Println("Election result:", response)
 	}
-	
+
 	fmt.Println("\n\nCandidates at end:", le.String())
 	verifyResults(responses)
 }
@@ -48,12 +51,12 @@ func must(err error) {
 	}
 }
 
-func runCandidate(zkHost, electionPath string, wg *sync.WaitGroup, leaderElector *leader.LeaderElector, respCh chan ElectionResponse) {
+func runCandidate(zkHost, electionPath string, wg *sync.WaitGroup, leaderElector *leader.Election, respCh chan ElectionResponse) {
 	isLeader, candidate := leaderElector.ElectLeader("n_", "president")
-//	fmt.Println("leaderElector AFTER ELECTION: leaderElector.IsLeader(", id, ")?:", leaderElector.IsLeader(id))
+	//	fmt.Println("leaderElector AFTER ELECTION: leaderElector.IsLeader(", id, ")?:", leaderElector.IsLeader(id))
 
 	leaderElector.Resign(candidate)
-//	fmt.Println("leaderElector AFTER RESIGN: leaderElector.IsLeader()?:", leaderElector.IsLeader(id))
+	//	fmt.Println("leaderElector AFTER RESIGN: leaderElector.IsLeader()?:", leaderElector.IsLeader(id))
 	respCh <- ElectionResponse{isLeader, candidate.CandidateID}
 	wg.Done()
 }
