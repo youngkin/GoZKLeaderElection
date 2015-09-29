@@ -20,12 +20,14 @@ type Candidate struct {
 // Election is a structure that represents a new instance of a Election. This instance can then
 // be used to request leadership for a specific resource.
 type Election struct {
-	zkHost       string
 	electionNode string
+	candidate    Candidate
+	// TODO: leader can be changed to a bool. See IsLeader() for more details.
 	leader       string
 	zkConn       *zk.Conn
+	// TODO: Probably don't need candidates. It's currently not set to anything except the single
+	// TODO: candidate associated with an instance of Election.
 	candidates   []Candidate
-	zkEventChnl  <-chan zk.Event
 }
 
 // NewElection initializes a new instance of a Election that can later be used to request
@@ -38,31 +40,34 @@ type Election struct {
 // It will return either a non-nil Election instance and a nil error, or a nil
 // Election and a non-nil error.
 //
-func NewElection(zkAddr string, electionNode string) (Election, error) {
-	conn, evtChnl := connect(zkAddr)
+func NewElection(zkConn *zk.Conn, electionNode string) (Election, error) {
 	//TODO: what should flags and acl be set to?
 	flags := int32(0)
 	acl := zk.WorldACL(zk.PermAll)
 
-	exists, _, _ := conn.Exists(electionNode)
+	exists, _, _ := zkConn.Exists(electionNode)
 	var (
 		path string
 		err  error
 	)
 	if !exists {
-		path, err = conn.Create(electionNode, []byte("data"), flags, acl)
+		path, err = zkConn.Create(electionNode, []byte("data"), flags, acl)
 		must(err)
 		fmt.Printf("created: %+v\n", path)
 	}
 
 	var candidates []Candidate
-	return Election{zkAddr, electionNode, "", conn, candidates, evtChnl}, nil
+	return Election{electionNode, Candidate{}, "", zkConn, candidates}, nil
 }
 
 // IsLeader returns true if the provided id is the leader, false otherwise.
 // Parameters:
 //	id - The ID of the candidate to be tested for leadership.
 func (le *Election) IsLeader(id string) bool {
+	// TODO: Since an instance of Election is unique to a single candidate all that's
+	// TODO: needed is a boolean that's set during leader election that indicates
+	// TODO: whether this Election instance represents the leader. So no parm is
+	// TODO: needed and this function is simply a getter for the isLeader field.
 	return strings.EqualFold(le.leader, id)
 }
 
@@ -77,6 +82,8 @@ func (le *Election) IsLeader(id string) bool {
 func (le *Election) ElectLeader(nomineePrefix, resource string) (bool, Candidate) {
 	candidate := makeOffer(nomineePrefix, le)
 	isLeader := determineLeader(candidate.CandidateID, le)
+	le.candidate = candidate
+	fmt.Println("Election Result: Leader?", isLeader, "; Candidate info:", le.candidate.CandidateID)
 	return isLeader, candidate
 }
 
@@ -104,6 +111,7 @@ func (le *Election) Resign(candidate Candidate) {
 	if strings.EqualFold(le.leader, candidate.CandidateID) {
 		le.leader = ""
 	}
+	fmt.Println("Resign:", candidate.CandidateID)
 	le.zkConn.Delete(candidate.CandidateID, -1)
 	removeCandidate(le, candidate.CandidateID)
 	return
@@ -120,7 +128,6 @@ func (le Election) String() string {
 		candidatesAsString = candidatesAsString + candidate.CandidateID + " "
 	}
 	return "Election:" +
-		"\n\tzkHost: \t" + le.zkHost +
 		"\n\telectionNode: \t" + le.electionNode +
 		"\n\tleader: \t" + le.leader +
 		"\n\tconnected?: \t" + connected +
@@ -131,14 +138,6 @@ func must(err error) {
 	if err != nil {
 		panic(err)
 	}
-}
-
-func connect(zksStr string) (*zk.Conn, <-chan zk.Event) {
-	//	zksStr := os.Getenv("ZOOKEEPER_SERVERS")
-	zks := strings.Split(zksStr, ",")
-	conn, evtChnl, err := zk.Connect(zks, time.Second)
-	must(err)
-	return conn, evtChnl
 }
 
 func makeOffer(nomineePrefix string, le *Election) Candidate {
@@ -163,7 +162,17 @@ func monitorLeaderChange(candidateID string, le *Election) <-chan string {
 
 func determineLeader(path string, le *Election) bool {
 	//	fmt.Println("determineLeader: path", path)
-	candidates, _, _, _ := le.zkConn.ChildrenW(le.electionNode)
+	candidates, _, evtChl, _ := le.zkConn.ChildrenW(le.electionNode)
+
+	// Watch for events on the children
+	go func(watchChnl <-chan zk.Event) {
+		fmt.Println("determineLeader.go func(), watchChnl event fired:", <-watchChnl)
+		children, _, _, _ := le.zkConn.ChildrenW(le.electionNode)
+		fmt.Println("determineLeader.go func() - Remaining Children:")
+		fmt.Println("\t", children)
+		time.Sleep(10 * time.Millisecond)
+	}(evtChl)
+
 	sort.Strings(candidates)
 	//	fmt.Println("Sorted Leader nominee list:", candidates)
 	pathNodes := strings.Split(path, "/")

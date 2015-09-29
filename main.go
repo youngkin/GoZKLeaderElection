@@ -2,8 +2,11 @@ package main
 
 import (
 	"fmt"
+	zk "github.com/samuel/go-zookeeper/zk"
 	"github.com/youngkin/GoZKLeaderElection/leader"
 	"sync"
+	"strings"
+	"time"
 )
 
 //Tests:
@@ -20,15 +23,12 @@ type ElectionResponse struct {
 }
 
 func main() {
-	le, err := leader.NewElection("192.168.12.11:2181", "/election")
-	must(err)
-	fmt.Println(le.String(), "\n\n")
-
 	respCh := make(chan ElectionResponse)
+	conn, _ := connect("192.168.12.11:2181")
 	var wg sync.WaitGroup
 	for i := 0; i < 3; i++ {
 		wg.Add(1)
-		go runCandidate("192.168.12.11:2181", "/election", &wg, &le, respCh)
+		go runCandidate(conn, "/election", &wg, respCh, uint(i))
 	}
 
 	go func() {
@@ -38,11 +38,19 @@ func main() {
 
 	responses := make([]ElectionResponse, 0)
 	for response := range respCh {
-		fmt.Println("Election result:", response)
+		fmt.Println("Final Election result:", response)
 	}
 
-	fmt.Println("\n\nCandidates at end:", le.String())
+	//	fmt.Println("\n\nCandidates at end:", le.String())
 	verifyResults(responses)
+}
+
+func connect(zksStr string) (*zk.Conn, <-chan zk.Event) {
+	//	zksStr := os.Getenv("ZOOKEEPER_SERVERS")
+	zks := strings.Split(zksStr, ",")
+	conn, evtChnl, err := zk.Connect(zks, time.Second)
+	must(err)
+	return conn, evtChnl
 }
 
 func must(err error) {
@@ -51,12 +59,19 @@ func must(err error) {
 	}
 }
 
-func runCandidate(zkHost, electionPath string, wg *sync.WaitGroup, leaderElector *leader.Election, respCh chan ElectionResponse) {
+func runCandidate(zkConn *zk.Conn, electionPath string, wg *sync.WaitGroup, respCh chan ElectionResponse, waitFor uint) {
+	leaderElector, err := leader.NewElection(zkConn, "/election")
+	must(err)
+	fmt.Println(leaderElector.String(), "\n\n")
+
 	isLeader, candidate := leaderElector.ElectLeader("n_", "president")
 	//	fmt.Println("leaderElector AFTER ELECTION: leaderElector.IsLeader(", id, ")?:", leaderElector.IsLeader(id))
 
+	sleepMillis := (waitFor*waitFor + 1) * 100
+	time.Sleep(time.Duration(sleepMillis) * time.Millisecond)
 	leaderElector.Resign(candidate)
-	//	fmt.Println("leaderElector AFTER RESIGN: leaderElector.IsLeader()?:", leaderElector.IsLeader(id))
+	//	fmt.Println("leaderElector AFTER RESIGN: leaderElector.IsLeader()?:", leaderElector.IsLeader(candidate.CandidateID))
+	time.Sleep(time.Duration(sleepMillis) * time.Millisecond)
 	respCh <- ElectionResponse{isLeader, candidate.CandidateID}
 	wg.Done()
 }
