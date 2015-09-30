@@ -4,8 +4,8 @@ import (
 	"fmt"
 	zk "github.com/samuel/go-zookeeper/zk"
 	"sort"
+	"strconv"
 	"strings"
-	"time"
 )
 
 // Candidate represents a Election client that has requested leadership. It consists of a CandidateID
@@ -14,20 +14,17 @@ import (
 // elected leader that it has assumed the leadership role for the resource.
 type Candidate struct {
 	CandidateID            string
-	LeaderNotificationChnl <-chan string
+	LeaderNotificationChnl <-chan string  // TODO: DELETE
 }
 
 // Election is a structure that represents a new instance of a Election. This instance can then
 // be used to request leadership for a specific resource.
 type Election struct {
-	electionNode string
-	candidate    Candidate
-	// TODO: leader can be changed to a bool. See IsLeader() for more details.
-	leader       string
-	zkConn       *zk.Conn
-	// TODO: Probably don't need candidates. It's currently not set to anything except the single
-	// TODO: candidate associated with an instance of Election.
-	candidates   []Candidate
+	electionNode  string
+	candidate     Candidate
+	isLeader      bool
+	zkConn        *zk.Conn
+	ldrshpChgChnl chan bool
 }
 
 // NewElection initializes a new instance of a Election that can later be used to request
@@ -56,19 +53,14 @@ func NewElection(zkConn *zk.Conn, electionNode string) (Election, error) {
 		fmt.Printf("created: %+v\n", path)
 	}
 
-	var candidates []Candidate
-	return Election{electionNode, Candidate{}, "", zkConn, candidates}, nil
+	return Election{electionNode, Candidate{}, false, zkConn, nil}, nil
 }
 
 // IsLeader returns true if the provided id is the leader, false otherwise.
 // Parameters:
 //	id - The ID of the candidate to be tested for leadership.
-func (le *Election) IsLeader(id string) bool {
-	// TODO: Since an instance of Election is unique to a single candidate all that's
-	// TODO: needed is a boolean that's set during leader election that indicates
-	// TODO: whether this Election instance represents the leader. So no parm is
-	// TODO: needed and this function is simply a getter for the isLeader field.
-	return strings.EqualFold(le.leader, id)
+func (le *Election) IsLeader() bool {
+	return le.isLeader
 }
 
 // ElectLeader will, for a given nomineePrefix and resource, make the caller a candidate
@@ -79,41 +71,27 @@ func (le *Election) IsLeader(id string) bool {
 // It returns true if leader and a string representing the full path to the candidate ID
 // (e.g., /election/president/n_00001). The candidate ID is needed when and if a candidate
 // wants to resign as leader.
-func (le *Election) ElectLeader(nomineePrefix, resource string) (bool, Candidate) {
+func (le *Election) ElectLeader(nomineePrefix, resource string) (bool, Candidate, chan bool) {
 	candidate := makeOffer(nomineePrefix, le)
-	isLeader := determineLeader(candidate.CandidateID, le)
 	le.candidate = candidate
-	fmt.Println("Election Result: Leader?", isLeader, "; Candidate info:", le.candidate.CandidateID)
-	return isLeader, candidate
-}
-
-// ElectAndSucceedLeader will, for a given nomineePrefix and resource, make the caller a candidate
-// for leadership and determine if the candidate becomes the leader.
-// The parameters are:
-//     nomineePrefix - a generic prefix (e.g., n_) for the election and a resource for which
-//     the election is being held (e.g., president).
-// It returns true if leader, a channel to notify candidates that the previous leader failed/resigned
-// and now they are the leader, and a string representing the full path to the candidate ID
-// (e.g., /election/president/n_00001). The candidate ID is needed when and if a candidate
-// wants to resign as leader.
-func (le *Election) ElectAndSucceedLeader(nomineePrefix, resource string) (bool, Candidate) {
-	candidate := makeOffer(nomineePrefix, le)
 	isLeader := determineLeader(candidate.CandidateID, le)
+	//	fmt.Println("Election Result: Leader?", isLeader, "; Candidate info:", le.candidate.CandidateID)
+
 	if !isLeader {
-		monitorLeaderChange(candidate.CandidateID, le)
+		le.ldrshpChgChnl = make(chan bool, 10)
 	}
-	return isLeader, candidate
+
+	return isLeader, candidate, le.ldrshpChgChnl
 }
 
-// Resign removes the associated Election as leader or follower for the associated resource.
 //	candidate - The candidate who is resigning. The value for candidate is returned from ElectLeader.
 func (le *Election) Resign(candidate Candidate) {
-	if strings.EqualFold(le.leader, candidate.CandidateID) {
-		le.leader = ""
+	if le.IsLeader() {
+		le.isLeader = false
 	}
-	fmt.Println("Resign:", candidate.CandidateID)
+	fmt.Println("\t\tResign:", candidate.CandidateID)
+	le.candidate = Candidate{}
 	le.zkConn.Delete(candidate.CandidateID, -1)
-	removeCandidate(le, candidate.CandidateID)
 	return
 }
 
@@ -123,15 +101,10 @@ func (le Election) String() string {
 	if le.zkConn != nil {
 		connected = "yes"
 	}
-	var candidatesAsString string
-	for _, candidate := range le.candidates {
-		candidatesAsString = candidatesAsString + candidate.CandidateID + " "
-	}
 	return "Election:" +
 		"\n\telectionNode: \t" + le.electionNode +
-		"\n\tleader: \t" + le.leader +
-		"\n\tconnected?: \t" + connected +
-		"\n\tcandidates: \t" + candidatesAsString
+		"\n\tleader: \t" + strconv.FormatBool(le.isLeader) +
+		"\n\tconnected?: \t" + connected
 }
 
 func must(err error) {
@@ -150,49 +123,39 @@ func makeOffer(nomineePrefix string, le *Election) Candidate {
 	leaderNotificationChnl := make(chan string)
 	//	fmt.Printf("makeOffer: created: %+v\n", path)
 	candidate := Candidate{path, leaderNotificationChnl}
-	le.candidates = append(le.candidates, candidate)
-	//	fmt.Println("makeOffer: candidates:", le.candidates)
 	return candidate
 }
 
-func monitorLeaderChange(candidateID string, le *Election) <-chan string {
-	ldrshpChgChan := make(<-chan string)
-	return ldrshpChgChan
-}
-
-func determineLeader(path string, le *Election) bool {
+func determineLeader(candidateID string, le *Election) bool {
 	//	fmt.Println("determineLeader: path", path)
 	candidates, _, evtChl, _ := le.zkConn.ChildrenW(le.electionNode)
 
-	// Watch for events on the children
-	go func(watchChnl <-chan zk.Event) {
-		fmt.Println("determineLeader.go func(), watchChnl event fired:", <-watchChnl)
-		children, _, _, _ := le.zkConn.ChildrenW(le.electionNode)
-		fmt.Println("determineLeader.go func() - Remaining Children:")
-		fmt.Println("\t", children)
-		time.Sleep(10 * time.Millisecond)
-	}(evtChl)
-
 	sort.Strings(candidates)
 	//	fmt.Println("Sorted Leader nominee list:", candidates)
-	pathNodes := strings.Split(path, "/")
+	pathNodes := strings.Split(candidateID, "/")
 	lenPath := len(pathNodes)
 	//	fmt.Println("Path nodes:", pathNodes, "len:", lenPath)
-	myID := pathNodes[lenPath-1]
-	//	fmt.Println("Election ID:", myID)
-	if strings.EqualFold(myID, candidates[0]) {
-		le.leader = path
-		return true
+	shortCndtID := pathNodes[lenPath-1]
+	//	fmt.Println("Election ID:", shortCndtID)
+	if strings.EqualFold(shortCndtID, candidates[0]) {
+		le.isLeader = true
+		return le.isLeader
 	}
+
+	go watchForLeadershipChanges(evtChl, le, candidateID)
 
 	return false
 }
 
-func removeCandidate(le *Election, candidateID string) {
-	for i, candidate := range le.candidates {
-		if strings.EqualFold(candidate.CandidateID, candidateID) {
-			le.candidates = append(le.candidates[:i], le.candidates[i+1:]...)
-			break
-		}
-	}
+func watchForLeadershipChanges(watchChnl <-chan zk.Event, le *Election, candidateID string) {
+	<- watchChnl
+//	watchEvt := <- watchChnl
+//	fmt.Println("\tdetermineLeader.go func(), watchChnl event fired:", watchEvt,
+//		"for Candidate", candidateID)
+	le.zkConn.ChildrenW(le.electionNode)
+//	children, _, _, _ := le.zkConn.ChildrenW(le.electionNode)
+//	fmt.Println("\tdetermineLeader.go func() - Remaining Children:")
+//	fmt.Println("\t\t", children)
+	le.ldrshpChgChnl <- determineLeader(candidateID, le)
+//	fmt.Println("\tDone with leader re-election", candidateID)
 }
