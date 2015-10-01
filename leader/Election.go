@@ -1,6 +1,7 @@
 package leader
 
 import (
+	"errors"
 	"fmt"
 	zk "github.com/samuel/go-zookeeper/zk"
 	"sort"
@@ -128,7 +129,15 @@ func makeOffer(nomineePrefix string, le *Election) Candidate {
 
 func determineLeader(candidateID string, le *Election) bool {
 	//	fmt.Println("determineLeader: path", path)
-	candidates, _, evtChl, _ := le.zkConn.ChildrenW(le.electionNode)
+	// TODO: DELETE
+//	candidates, _, evtChl, _ := le.zkConn.ChildrenW(le.electionNode)
+	// TODO: How to make this more bullet-proof? Check stat, err? Must have at least
+	// TODO: one child, me?
+	candidates, _, _ := le.zkConn.Children(le.electionNode)
+	if len(candidates) == 0 {
+		fmt.Println("No children exist in ZK, not even me", candidateID)
+		panic(errors.New("No children exist in ZK"))
+	}
 
 	sort.Strings(candidates)
 	//	fmt.Println("Sorted Leader nominee list:", candidates)
@@ -141,21 +150,49 @@ func determineLeader(candidateID string, le *Election) bool {
 		le.isLeader = true
 		return le.isLeader
 	}
-
-	go watchForLeadershipChanges(evtChl, le, candidateID)
+	
+	// Not leader, so watch next highest candidate
+	idx := sort.SearchStrings(candidates, shortCndtID)
+	var nodeToWatchIdx int
+	if strings.EqualFold(candidates[idx], shortCndtID) {
+		nodeToWatchIdx = idx - 1
+	} else {
+		// TODO: WTF, this shouldn't happen. How to best handle this?
+		fmt.Println("candidates[0]:", candidates[0])
+		fmt.Println("candidates[1]:", candidates[1])
+		fmt.Println("candidate", candidateID, "doesn't exist in ZK")
+		panic(errors.New("Candidate doesn't exist in ZK"))
+	}
+	// TODO: How to make this more bullet-proof? If doesn't exist
+	// TODO: should it go through the remaining prior Candidates? That will happen if
+	// TODO: this node is watching an intermediate, non-leader, node that fails.
+	// TODO: What if none of them exist (i.e., len(candidates) == 0, but then it would be leader), then it should become leader.
+	watchedNode := strings.Join([]string{le.electionNode, candidates[nodeToWatchIdx]}, "/")
+	exists, _, watchChl, _ := le.zkConn.ExistsW(watchedNode)
+	if !exists {
+		fmt.Println("Watched candidate", watchedNode, "doesn't exist in ZK")
+		panic(errors.New("Watched candidate doesn't exist in ZK"))
+	}
+//	fmt.Println("Candidate:", candidateID, "is watching candidate:", watchedNode)
+//	fmt.Println("Does", watchedNode, "exist?", exists)
+//	fmt.Println("Candidate", candidateID, "will watch on channel", watchChl)
+	go watchForLeadershipChanges(watchChl, le, candidateID)
 
 	return false
 }
 
 func watchForLeadershipChanges(watchChnl <-chan zk.Event, le *Election, candidateID string) {
-	<- watchChnl
-//	watchEvt := <- watchChnl
+	watchEvt := <- watchChnl
 //	fmt.Println("\tdetermineLeader.go func(), watchChnl event fired:", watchEvt,
 //		"for Candidate", candidateID)
+	if watchEvt.Type == zk.EventNodeDeleted {
+	//	children, _, _, _ := le.zkConn.ChildrenW(le.electionNode)
+	//	fmt.Println("\tdetermineLeader.go func() - Remaining Children:")
+	//	fmt.Println("\t\t", children)
+		le.ldrshpChgChnl <- determineLeader(candidateID, le)
+	//	fmt.Println("\tDone with leader re-election", candidateID)
+		
+	}
+	// TODO: change this to watching just the previous child vs. all children
 	le.zkConn.ChildrenW(le.electionNode)
-//	children, _, _, _ := le.zkConn.ChildrenW(le.electionNode)
-//	fmt.Println("\tdetermineLeader.go func() - Remaining Children:")
-//	fmt.Println("\t\t", children)
-	le.ldrshpChgChnl <- determineLeader(candidateID, le)
-//	fmt.Println("\tDone with leader re-election", candidateID)
 }

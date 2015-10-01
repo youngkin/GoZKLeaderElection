@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	zk "github.com/samuel/go-zookeeper/zk"
 	"github.com/youngkin/GoZKLeaderElection/leader"
@@ -8,6 +9,8 @@ import (
 	"sync"
 	"time"
 )
+
+
 
 //Tests:
 //	1. Of multiple candidates, only 1 becomes leader
@@ -24,7 +27,7 @@ type ElectionResponse struct {
 
 func main() {
 	respCh := make(chan ElectionResponse)
-	conn, _ := connect("192.168.12.11:2181")
+	conn, connEvtChan := connect("192.168.12.11:2181")
 	var wg sync.WaitGroup
 	for i := 0; i < 3; i++ {
 		wg.Add(1)
@@ -34,6 +37,22 @@ func main() {
 	go func() {
 		wg.Wait()
 		close(respCh)
+	}()
+
+	go func() {
+		var retries int
+		for {
+			select {
+			case evt := <-connEvtChan:
+				fmt.Println("Received channel event:", evt)
+				if evt.State == zk.StateDisconnected {
+					if retries > 5 {
+						panic(errors.New("OMG, lost connectivity to ZK"))
+					}
+					retries++
+				}
+			}
+		}
 	}()
 
 	responses := make([]ElectionResponse, 0)
@@ -51,9 +70,9 @@ func main() {
 func connect(zksStr string) (*zk.Conn, <-chan zk.Event) {
 	//	zksStr := os.Getenv("ZOOKEEPER_SERVERS")
 	zks := strings.Split(zksStr, ",")
-	conn, evtChnl, err := zk.Connect(zks, time.Second)
+	conn, connEvtChan, err := zk.Connect(zks, time.Second)
 	must(err)
-	return conn, evtChnl
+	return conn, connEvtChan
 }
 
 func must(err error) {
@@ -80,7 +99,7 @@ func runCandidate(zkConn *zk.Conn, electionPath string, wg *sync.WaitGroup, resp
 			if isLeader {
 				respCh <- ElectionResponse{isLeader, candidate.CandidateID}
 			}
-		case <-time.NewTimer(time.Second).C:
+		case <-time.NewTimer(100 * time.Second).C:
 			fmt.Println("Timer expired, stop waiting to become leader for", candidate.CandidateID)
 			wg.Done()
 			return
@@ -88,8 +107,8 @@ func runCandidate(zkConn *zk.Conn, electionPath string, wg *sync.WaitGroup, resp
 	}
 
 	// do some work when I become leader
-	sleepMillis := (waitFor*waitFor + 1) * 100
-	time.Sleep(time.Duration(sleepMillis) * time.Millisecond)
+	sleepMillis := waitFor*waitFor + 1
+	time.Sleep(time.Duration(sleepMillis) * time.Second)
 
 	leaderElector.Resign(candidate)
 	//	fmt.Println("leaderElector AFTER RESIGN: leaderElector.IsLeader()?:", leaderElector.IsLeader(candidate.CandidateID))
