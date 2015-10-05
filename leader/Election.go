@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // Candidate represents a Election client that has requested leadership. It consists of a CandidateID
@@ -15,7 +16,7 @@ import (
 // elected leader that it has assumed the leadership role for the resource.
 type Candidate struct {
 	CandidateID            string
-	LeaderNotificationChnl <-chan string  // TODO: DELETE
+	LeaderNotificationChnl <-chan string // TODO: DELETE
 }
 
 // Election is a structure that represents a new instance of a Election. This instance can then
@@ -57,13 +58,6 @@ func NewElection(zkConn *zk.Conn, electionNode string) (Election, error) {
 	return Election{electionNode, Candidate{}, false, zkConn, nil}, nil
 }
 
-// IsLeader returns true if the provided id is the leader, false otherwise.
-// Parameters:
-//	id - The ID of the candidate to be tested for leadership.
-func (le *Election) IsLeader() bool {
-	return le.isLeader
-}
-
 // ElectLeader will, for a given nomineePrefix and resource, make the caller a candidate
 // for leadership and determine if the candidate becomes the leader.
 // The parameters are:
@@ -85,15 +79,38 @@ func (le *Election) ElectLeader(nomineePrefix, resource string) (bool, Candidate
 	return isLeader, candidate, le.ldrshpChgChnl
 }
 
+// IsLeader returns true if the provided id is the leader, false otherwise.
+// Parameters:
+//	id - The ID of the candidate to be tested for leadership.
+func (le *Election) IsLeader() bool {
+	return le.isLeader
+}
+
+func (le *Election) ID() string {
+	return le.candidate.CandidateID
+}
 //	candidate - The candidate who is resigning. The value for candidate is returned from ElectLeader.
-func (le *Election) Resign(candidate Candidate) {
+func (le *Election) Resign(candidate Candidate) error {
 	if le.IsLeader() {
 		le.isLeader = false
 	}
 	fmt.Println("\t\tResign:", candidate.CandidateID)
+	err := le.zkConn.Delete(candidate.CandidateID, -1)
+	if err != nil {
+		fmt.Println("Candidate", le.candidate.CandidateID, "failed to resign because of", err, ".  Should retry here")
+		time.Sleep(5 * time.Second)
+		err = le.zkConn.Delete(candidate.CandidateID, -1)
+		if err != nil {
+			// At this point reconnection attempts may not succeed. Continue with resignation process.
+			// The larger application should handle persistent connection problems by restarting
+			fmt.Println("Candidate", le.candidate.CandidateID, "failed to resign because of", err, 
+				".  Retried once, panicking")
+			err2 := fmt.Errorf("Unable to Resign due to error (%v)", err)
+			return err2
+		}
+	}
 	le.candidate = Candidate{}
-	le.zkConn.Delete(candidate.CandidateID, -1)
-	return
+	return nil
 }
 
 // String is the Stringer implementation for this type.
@@ -130,7 +147,7 @@ func makeOffer(nomineePrefix string, le *Election) Candidate {
 func determineLeader(candidateID string, le *Election) bool {
 	//	fmt.Println("determineLeader: path", path)
 	// TODO: DELETE
-//	candidates, _, evtChl, _ := le.zkConn.ChildrenW(le.electionNode)
+	//	candidates, _, evtChl, _ := le.zkConn.ChildrenW(le.electionNode)
 	// TODO: How to make this more bullet-proof? Check stat, err? Must have at least
 	// TODO: one child, me?
 	candidates, _, _ := le.zkConn.Children(le.electionNode)
@@ -150,7 +167,7 @@ func determineLeader(candidateID string, le *Election) bool {
 		le.isLeader = true
 		return le.isLeader
 	}
-	
+
 	// Not leader, so watch next highest candidate
 	idx := sort.SearchStrings(candidates, shortCndtID)
 	var nodeToWatchIdx int
@@ -173,25 +190,25 @@ func determineLeader(candidateID string, le *Election) bool {
 		fmt.Println("Watched candidate", watchedNode, "doesn't exist in ZK")
 		panic(errors.New("Watched candidate doesn't exist in ZK"))
 	}
-//	fmt.Println("Candidate:", candidateID, "is watching candidate:", watchedNode)
-//	fmt.Println("Does", watchedNode, "exist?", exists)
-//	fmt.Println("Candidate", candidateID, "will watch on channel", watchChl)
+	//	fmt.Println("Candidate:", candidateID, "is watching candidate:", watchedNode)
+	//	fmt.Println("Does", watchedNode, "exist?", exists)
+	//	fmt.Println("Candidate", candidateID, "will watch on channel", watchChl)
 	go watchForLeadershipChanges(watchChl, le, candidateID)
 
 	return false
 }
 
 func watchForLeadershipChanges(watchChnl <-chan zk.Event, le *Election, candidateID string) {
-	watchEvt := <- watchChnl
-//	fmt.Println("\tdetermineLeader.go func(), watchChnl event fired:", watchEvt,
-//		"for Candidate", candidateID)
+	watchEvt := <-watchChnl
+	//	fmt.Println("\tdetermineLeader.go func(), watchChnl event fired:", watchEvt,
+	//		"for Candidate", candidateID)
 	if watchEvt.Type == zk.EventNodeDeleted {
-	//	children, _, _, _ := le.zkConn.ChildrenW(le.electionNode)
-	//	fmt.Println("\tdetermineLeader.go func() - Remaining Children:")
-	//	fmt.Println("\t\t", children)
+		//	children, _, _, _ := le.zkConn.ChildrenW(le.electionNode)
+		//	fmt.Println("\tdetermineLeader.go func() - Remaining Children:")
+		//	fmt.Println("\t\t", children)
 		le.ldrshpChgChnl <- determineLeader(candidateID, le)
-	//	fmt.Println("\tDone with leader re-election", candidateID)
-		
+		//	fmt.Println("\tDone with leader re-election", candidateID)
+
 	}
 	// TODO: change this to watching just the previous child vs. all children
 	le.zkConn.ChildrenW(le.electionNode)

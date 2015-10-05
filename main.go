@@ -10,14 +10,14 @@ import (
 	"time"
 )
 
-
-
 //Tests:
 //	1. Of multiple candidates, only 1 becomes leader
 //	2. When a leader of multiple candidates resigns, one of the remaining candidates is chosen as leader
 //	3. When the last leader resigns there is no leader and no remaining candidates
 //	4. When the ZK connection is lost all candidates are notified and WHAT HAPPENS???
 //	5. How does it work in a distributed (i.e., multi-process/multi-host) environment
+//		i. When ZK connection is lost to one ZK in a cluster
+//			a. All happy-path scenarios still work
 //
 
 type ElectionResponse struct {
@@ -28,6 +28,26 @@ type ElectionResponse struct {
 func main() {
 	respCh := make(chan ElectionResponse)
 	conn, connEvtChan := connect("192.168.12.11:2181")
+
+	// Monitor channel events
+	go func() {
+		var retries int
+		for {
+			evt := <-connEvtChan
+			fmt.Println("Received channel event:", evt)
+			if evt.State == zk.StateDisconnected {
+				if retries > 5 {
+					// This is what essentially what Election clients should do
+					panic(errors.New("OMG, lost connectivity to ZK"))
+				}
+				retries++
+			}
+		}
+	}()
+
+	// Wait to log connect events from above goroutine
+	time.Sleep(2 * time.Second)
+
 	var wg sync.WaitGroup
 	for i := 0; i < 3; i++ {
 		wg.Add(1)
@@ -37,22 +57,6 @@ func main() {
 	go func() {
 		wg.Wait()
 		close(respCh)
-	}()
-
-	go func() {
-		var retries int
-		for {
-			select {
-			case evt := <-connEvtChan:
-				fmt.Println("Received channel event:", evt)
-				if evt.State == zk.StateDisconnected {
-					if retries > 5 {
-						panic(errors.New("OMG, lost connectivity to ZK"))
-					}
-					retries++
-				}
-			}
-		}
 	}()
 
 	responses := make([]ElectionResponse, 0)
@@ -70,13 +74,14 @@ func main() {
 func connect(zksStr string) (*zk.Conn, <-chan zk.Event) {
 	//	zksStr := os.Getenv("ZOOKEEPER_SERVERS")
 	zks := strings.Split(zksStr, ",")
-	conn, connEvtChan, err := zk.Connect(zks, time.Second)
+	conn, connEvtChan, err := zk.Connect(zks, 5*time.Second)
 	must(err)
 	return conn, connEvtChan
 }
 
 func must(err error) {
 	if err != nil {
+		fmt.Println("must(", err, ") called")
 		panic(err)
 	}
 }
@@ -107,11 +112,13 @@ func runCandidate(zkConn *zk.Conn, electionPath string, wg *sync.WaitGroup, resp
 	}
 
 	// do some work when I become leader
-	sleepMillis := waitFor*waitFor + 1
-	time.Sleep(time.Duration(sleepMillis) * time.Second)
+	sleepSeconds := waitFor*waitFor + 1
+	time.Sleep(time.Duration(sleepSeconds) * time.Second)
 
-	leaderElector.Resign(candidate)
-	//	fmt.Println("leaderElector AFTER RESIGN: leaderElector.IsLeader()?:", leaderElector.IsLeader(candidate.CandidateID))
+	err = leaderElector.Resign(candidate)
+	if err != nil {
+		fmt.Println("leaderElector AFTER FAILED RESIGN: error is", err)
+	}
 
 	wg.Done()
 }
